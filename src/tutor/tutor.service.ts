@@ -1,10 +1,4 @@
-import {
-  BadRequestException,
-  ConflictException,
-  Injectable,
-  NotFoundException,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectModel } from '@nestjs/mongoose';
@@ -18,12 +12,17 @@ import { LoginTutorDto } from './dto/login-tutor.dto';
 import { VerifyTutorEmailDto } from './dto/verify-tutor-email.dto';
 import { UpdateTutorProfileDto } from './dto/update-tutor-profile.dto';
 import { ForgetTutorPasswordDto } from './dto/forget-tutor-password.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { ResetTutorPasswordDto } from './dto/reset-tutor-password.dto';
 import { Tutor, TutorDocument } from './schemas/tutor.schema';
 import {
   PasswordResetToken,
   PasswordResetTokenDocument,
 } from './schemas/password-reset-token.schema';
+import {
+  RefreshToken,
+  RefreshTokenDocument,
+} from './schemas/refresh-token.schema';
 
 const ACCESS_TOKEN_EXPIRY = 3600;
 const REFRESH_TOKEN_EXPIRY = 604800;
@@ -38,6 +37,8 @@ export class TutorService {
     private readonly tutorModel: Model<TutorDocument>,
     @InjectModel(PasswordResetToken.name)
     private readonly passwordResetTokenModel: Model<PasswordResetTokenDocument>,
+    @InjectModel(RefreshToken.name)
+    private readonly refreshTokenModel: Model<RefreshTokenDocument>,
     private readonly eventEmitter: EventEmitter2,
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
@@ -62,7 +63,8 @@ export class TutorService {
     );
   }
 
-  private async generateTokenPair(tutor: TutorDocument) {
+  private async generateTokenPair(tutor: TutorDocument, tokenFamily?: string) {
+    const family = tokenFamily ?? crypto.randomUUID();
     const accessToken = this.jwtService.sign(
       { sub: tutor.id, email: tutor.email, role: tutor.role },
       { expiresIn: ACCESS_TOKEN_EXPIRY },
@@ -71,10 +73,20 @@ export class TutorService {
       {
         sub: tutor.id,
         type: 'refresh',
+        family,
         jti: crypto.randomBytes(16).toString('hex'),
       },
       { expiresIn: REFRESH_TOKEN_EXPIRY },
     );
+
+    await new this.refreshTokenModel({
+      userId: tutor.id,
+      tokenHash: this.hashToken(refreshToken),
+      family,
+      expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRY * 1000),
+      revoked: false,
+    }).save();
+
     return { accessToken, refreshToken, expiresIn: ACCESS_TOKEN_EXPIRY };
   }
 
@@ -147,6 +159,11 @@ export class TutorService {
     tutor.verificationTokenExpiry =
       Date.now() + VERIFICATION_TOKEN_EXPIRY * 1000;
     await tutor.save();
+
+    await this.emailService.sendVerificationEmail(
+      tutor.email,
+      verificationToken,
+    );
 
     return {
       message: 'Account created. Please verify your email.',
@@ -227,6 +244,63 @@ export class TutorService {
       user: this.sanitizeTutor(tutor),
       ...tokens,
     };
+  }
+
+  async refreshToken(dto: RefreshTokenDto) {
+    if (!dto.refreshToken) {
+      throw new BadRequestException('Refresh token is required');
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = this.verifyJwt(dto.refreshToken);
+    } catch {
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    }
+
+    if (payload.type !== 'refresh') {
+      throw new UnauthorizedException('Invalid refresh token type');
+    }
+
+    const tokenHash = this.hashToken(dto.refreshToken);
+    const stored = await this.refreshTokenModel
+      .findOne({ tokenHash, revoked: false })
+      .exec();
+
+    if (!stored) {
+      const family = payload.family as string | undefined;
+      if (family) {
+        await this.refreshTokenModel
+          .updateMany({ family, revoked: false }, { revoked: true })
+          .exec();
+      }
+      throw new UnauthorizedException(
+        'Refresh token has been revoked or already used',
+      );
+    }
+
+    stored.revoked = true;
+    await stored.save();
+
+    const tutor = await this.tutorModel.findById(stored.userId).exec();
+    if (!tutor) {
+      throw new NotFoundException('Tutor not found');
+    }
+
+    return this.generateTokenPair(tutor, stored.family);
+  }
+
+  async logout(dto: RefreshTokenDto) {
+    if (!dto.refreshToken) {
+      throw new BadRequestException('Refresh token is required');
+    }
+
+    const tokenHash = this.hashToken(dto.refreshToken);
+    await this.refreshTokenModel
+      .updateOne({ tokenHash }, { revoked: true })
+      .exec();
+
+    return { message: 'Logged out successfully' };
   }
 
   private hashToken(token: string): string {
@@ -366,5 +440,63 @@ export class TutorService {
     await tutor.save();
 
     return this.sanitizeTutor(tutor);
+  }
+
+  async refreshToken(dto: RefreshTokenDto) {
+    if (!dto.refreshToken) {
+      throw new BadRequestException('Refresh token is required');
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = this.verifyJwt(dto.refreshToken);
+    } catch {
+      throw new UnauthorizedException('Invalid or expired refresh token');
+    }
+
+    if (payload.type !== 'refresh') {
+      throw new UnauthorizedException('Invalid token type');
+    }
+
+    const tokenHash = this.hashToken(dto.refreshToken);
+    const stored = await this.refreshTokenModel.findOne({ tokenHash }).exec();
+
+    // If token not found or already revoked, it's a security breach/replay attack
+    if (!stored || stored.revoked) {
+      const family = (payload.family as string) || (stored?.family);
+      if (family) {
+        // Revoke all tokens in the family
+        await this.refreshTokenModel.updateMany({ family }, { $set: { revoked: true } }).exec();
+      }
+      throw new UnauthorizedException('Refresh token has been revoked or already used');
+    }
+
+    // Revoke the old token (mark as revoked)
+    stored.revoked = true;
+    await stored.save();
+
+    // Get tutor
+    const tutor = await this.tutorModel.findById(stored.userId).exec();
+    if (!tutor) {
+      throw new NotFoundException('Tutor not found');
+    }
+
+    if (tutor.accountStatus !== 'active') {
+      throw new UnauthorizedException('Tutor account is not active');
+    }
+
+    // Generate new token pair under the same family
+    return this.generateTokenPair(tutor, stored.family);
+  }
+
+  async logout(dto: RefreshTokenDto) {
+    if (!dto.refreshToken) {
+      throw new BadRequestException('Refresh token is required');
+    }
+
+    const tokenHash = this.hashToken(dto.refreshToken);
+    await this.refreshTokenModel.updateOne({ tokenHash }, { $set: { revoked: true } }).exec();
+
+    return { message: 'Logged out successfully' };
   }
 }

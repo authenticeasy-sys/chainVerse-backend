@@ -15,6 +15,7 @@ import {
   CartItemDocument,
 } from '../student-cart/schemas/cart-item.schema';
 import { DomainEvents } from '../events/event-names';
+import { StellarService } from '../stellar/stellar.service';
 
 @Injectable()
 export class StudentEnrollmentService {
@@ -26,6 +27,7 @@ export class StudentEnrollmentService {
     @InjectModel(CartItem.name)
     private readonly cartItemModel: Model<CartItemDocument>,
     private readonly eventEmitter: EventEmitter2,
+    private readonly stellarService: StellarService,
   ) {}
 
   async enrollFree(studentId: string, courseId: string): Promise<Enrollment> {
@@ -62,10 +64,9 @@ export class StudentEnrollmentService {
 
     const savedEnrollment = await enrollment.save();
 
-    // Update course's enrolled students and total enrollments
+    // Update course total enrollments counter
     await this.courseModel
       .findByIdAndUpdate(courseId, {
-        $addToSet: { enrolledStudents: studentId },
         $inc: { totalEnrollments: 1 },
       })
       .exec();
@@ -84,10 +85,25 @@ export class StudentEnrollmentService {
   async checkoutCart(
     studentId: string,
     paymentMethod?: string,
+    transactionHash?: string,
   ): Promise<{ enrolled: string[]; failed: string[]; totalAmount: number }> {
     const cartItems = await this.cartItemModel.find({ studentId }).exec();
     if (cartItems.length === 0) {
       throw new BadRequestException('Cart is empty');
+    }
+
+    const courseIds = cartItems
+      .filter((i) => isValidObjectId(i.courseId))
+      .map((i) => i.courseId);
+    const courses = await this.courseModel
+      .find({ _id: { $in: courseIds } })
+      .exec();
+    const courseMap = new Map(courses.map((c) => [c._id.toString(), c]));
+    const paidCourses = courses.filter((c) => c.price > 0);
+    if (paidCourses.length > 0) {
+      throw new NotImplementedException(
+        'Paid course checkout requires a Stellar transaction hash. See API docs for the payment flow.',
+      );
     }
 
     const enrolled: string[] = [];
@@ -101,7 +117,7 @@ export class StudentEnrollmentService {
           continue;
         }
 
-        const course = await this.courseModel.findById(item.courseId).exec();
+        const course = courseMap.get(item.courseId);
         if (!course) {
           failed.push(item.courseId);
           continue;
@@ -122,28 +138,46 @@ export class StudentEnrollmentService {
           continue;
         }
 
-        // Paid courses require a real payment step — not yet implemented
         if (course.price > 0) {
-          throw new NotImplementedException(
-            'Payment processing is not yet implemented. Paid course enrollment is unavailable.',
-          );
+          if (!transactionHash) {
+            throw new BadRequestException(
+              'Transaction hash is required for paid course enrollment.',
+            );
+          }
+
+          const platformAddress = process.env.PLATFORM_STELLAR_ADDRESS;
+          if (!platformAddress) {
+            throw new BadRequestException(
+              'Platform Stellar address is not configured.',
+            );
+          }
+
+          const payment = await this.stellarService.verifyPayment({
+            transactionHash,
+            expectedAmount: course.price,
+            expectedDestination: platformAddress,
+          });
+
+          if (!payment.verified) {
+            throw new BadRequestException('Payment not confirmed on-chain');
+          }
         }
 
         const enrollment = new this.enrollmentModel({
           studentId,
           courseId: item.courseId,
-          type: 'free',
-          amountPaid: 0,
+          type: course.price > 0 ? 'paid' : 'free',
+          amountPaid: course.price,
           status: 'completed',
           paymentMethod,
+          transactionHash: transactionHash,
         });
 
         await enrollment.save();
 
-        // Update course's enrolled students and total enrollments
+        // Update course total enrollments counter
         await this.courseModel
           .findByIdAndUpdate(item.courseId, {
-            $addToSet: { enrolledStudents: studentId },
             $inc: { totalEnrollments: 1 },
           })
           .exec();

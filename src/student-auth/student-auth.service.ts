@@ -1,10 +1,4 @@
-import {
-  BadRequestException,
-  ConflictException,
-  Injectable,
-  NotFoundException,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectModel } from '@nestjs/mongoose';
@@ -32,11 +26,11 @@ import {
   PasswordResetTokenDocument,
 } from './schemas/password-reset-token.schema';
 
-const ACCESS_TOKEN_EXPIRY = 3600;
-const REFRESH_TOKEN_EXPIRY = 604800;
-const BCRYPT_SALT_ROUNDS = 10;
+const ACCESS_TOKEN_EXPIRY = 3600; // 1 hour
+const REFRESH_TOKEN_EXPIRY = 604800; // 7 days
 const VERIFICATION_TOKEN_EXPIRY = 86400; // 24 hours
 const RESET_TOKEN_EXPIRY = 900; // 15 minutes
+const BCRYPT_SALT_ROUNDS = 10;
 const VERIFICATION_COOLDOWN = 60; // 1 minute cooldown between attempts
 const VERIFICATION_ATTEMPT_WINDOW = 900; // 15 minutes window for attempt counting
 const MAX_VERIFICATION_ATTEMPTS = 5; // Maximum 5 attempts per window
@@ -165,6 +159,11 @@ export class StudentAuthService {
     student.verificationTokenExpiry =
       Date.now() + VERIFICATION_TOKEN_EXPIRY * 1000;
     await student.save();
+
+    await this.emailService.sendVerificationEmail(
+      student.email,
+      verificationToken,
+    );
 
     this.eventEmitter.emit(
       DomainEvents.STUDENT_REGISTERED,
@@ -324,19 +323,32 @@ export class StudentAuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
+    if (student.lockedUntil && student.lockedUntil > new Date()) {
+      throw new UnauthorizedException('Account temporarily locked. Try again later.');
+    }
+
     const passwordValid = await this.verifyPassword(
       dto.password,
       student.passwordHash,
     );
     if (!passwordValid) {
+      student.loginAttempts += 1;
+      if (student.loginAttempts >= 5) {
+        student.lockedUntil = new Date(Date.now() + 15 * 60 * 1000);
+      }
+      await student.save();
       throw new UnauthorizedException('Invalid email or password');
     }
 
     if (!student.emailVerified) {
       throw new UnauthorizedException(
-        'Please verify your email before logging in',
+        'Please verify your email address before logging in.',
       );
     }
+
+    student.loginAttempts = 0;
+    student.lockedUntil = null;
+    await student.save();
 
     const tokens = await this.generateTokenPair(student);
 
@@ -483,23 +495,32 @@ export class StudentAuthService {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
+    if (payload.type !== 'refresh') {
+      throw new UnauthorizedException('Invalid token type');
+    }
+
     const tokenHash = this.hashToken(dto.refreshToken);
     const stored = await this.refreshTokenModel.findOne({ tokenHash }).exec();
 
     if (!stored) {
-      // Token not in DB — possible replay of an already-rotated token.
-      // Revoke the entire token family to invalidate any sessions derived from it.
-      const family = payload.family as string | undefined;
-      if (family) {
-        await this.refreshTokenModel.deleteMany({ tokenFamily: family }).exec();
-      }
       throw new UnauthorizedException(
         'Refresh token has been revoked or already used',
       );
     }
 
-    // Rotate: delete consumed token, issue new pair in the same family
-    await this.refreshTokenModel.deleteOne({ tokenHash }).exec();
+    if (stored.isRevoked) {
+      // Token is already revoked: revoke ALL tokens in the family (theft detected)
+      await this.refreshTokenModel
+        .updateMany({ tokenFamily: stored.tokenFamily }, { isRevoked: true })
+        .exec();
+      throw new UnauthorizedException(
+        'Refresh token has been revoked or already used',
+      );
+    }
+
+    // Mark old token revoked
+    stored.isRevoked = true;
+    await stored.save();
 
     const student = await this.studentModel.findById(stored.studentId).exec();
     if (!student) {

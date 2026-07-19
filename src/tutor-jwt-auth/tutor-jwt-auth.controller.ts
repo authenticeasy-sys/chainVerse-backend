@@ -1,14 +1,6 @@
 import { ApiBearerAuth } from '@nestjs/swagger';
-import {
-  Body,
-  Controller,
-  Delete,
-  Get,
-  Param,
-  Patch,
-  Post,
-  UseGuards,
-} from '@nestjs/common';
+import { ParseObjectIdPipe } from '../common/pipes/parse-object-id.pipe';
+import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import { TutorJwtAuthService } from './tutor-jwt-auth.service';
 import { CreateTutorJwtAuthDto } from './dto/create-tutor-jwt-auth.dto';
 import { UpdateTutorJwtAuthDto } from './dto/update-tutor-jwt-auth.dto';
@@ -28,7 +20,7 @@ export class TutorJwtAuthController {
   }
 
   @Get(':id')
-  async findOne(@Param('id') id: string) {
+  async findOne(@Param('id', new ParseObjectIdPipe()) id: string) {
     return this.service.findOne(id);
   }
 
@@ -43,7 +35,7 @@ export class TutorJwtAuthController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.ADMIN, Role.MODERATOR, Role.TUTOR)
   async update(
-    @Param('id') id: string,
+    @Param('id', new ParseObjectIdPipe()) id: string,
     @Body() payload: UpdateTutorJwtAuthDto,
   ) {
     return this.service.update(id, payload);
@@ -52,7 +44,7 @@ export class TutorJwtAuthController {
   @Delete(':id')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.ADMIN, Role.MODERATOR)
-  async remove(@Param('id') id: string) {
+  async remove(@Param('id', new ParseObjectIdPipe()) id: string) {
     return this.service.remove(id);
   }
 }

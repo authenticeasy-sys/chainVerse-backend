@@ -1,8 +1,4 @@
-import {
-  Injectable,
-  NotFoundException,
-  BadRequestException,
-} from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import {
@@ -16,7 +12,6 @@ import { VerificationLog as VerificationLogEntity } from './verification-log.ent
 import { TicketService } from '../tickets-inventory/services/ticket.service';
 import { EventsService } from '../events/events.service';
 import { TicketStatus } from '../tickets-inventory/entities/ticket.entity';
-import { Ticket } from '../tickets-inventory/entities/ticket.entity';
 
 /**
  * Verification Service for VeriTix

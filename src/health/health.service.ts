@@ -1,6 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import * as net from 'net';
+import { Injectable, Optional } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import { Connection } from 'mongoose';
+import { StellarService } from '../stellar/stellar.service';
 
 export type ProbeStatus = 'ok' | 'error' | 'not_configured';
 
@@ -16,6 +18,7 @@ export interface ReadinessResult {
   checks: {
     database: ProbeResult;
     cache: ProbeResult;
+    stellar: ProbeResult;
   };
 }
 
@@ -23,11 +26,9 @@ export interface ReadinessResult {
 export class HealthService {
   constructor(
     @InjectConnection() private readonly connection: Connection,
+    @Optional() private readonly stellarService?: StellarService,
   ) {}
-  /**
-   * Attempts a raw TCP connection and resolves with the round-trip latency.
-   * This works regardless of which client library (if any) is installed.
-   */
+
   private tcpProbe(
     host: string,
     port: number,
@@ -56,13 +57,11 @@ export class HealthService {
     const uri = process.env.MONGO_URI ?? process.env.MONGODB_URI;
     if (!uri) return null;
 
-    // mongodb+srv://[user:pass@]host/db — no port in the URI itself
     if (uri.startsWith('mongodb+srv://')) {
       const m = uri.match(/mongodb\+srv:\/\/(?:[^@]+@)?([^/?]+)/);
       return m ? { host: m[1], port: 27017 } : null;
     }
 
-    // mongodb://[user:pass@]host[:port]/db
     const m = uri.match(/mongodb:\/\/(?:[^@]+@)?([^/:?]+)(?::(\d+))?/);
     if (!m) return null;
     return { host: m[1], port: m[2] ? parseInt(m[2], 10) : 27017 };
@@ -72,7 +71,6 @@ export class HealthService {
     const uri = process.env.REDIS_URL;
     if (!uri) return null;
 
-    // redis[s]://[[user]:pass@]host[:port][/db]
     const m = uri.match(/rediss?:\/\/(?:[^@]+@)?([^/:?]+)(?::(\d+))?/);
     if (!m) return null;
     return { host: m[1], port: m[2] ? parseInt(m[2], 10) : 6379 };
@@ -83,8 +81,7 @@ export class HealthService {
     const start = Date.now();
     try {
       await this.connection.db.admin().ping();
-      const latency_ms = Date.now() - start;
-      return { status: 'ok', latency_ms };
+      return { status: 'ok', latency_ms: Date.now() - start };
     } catch (err: any) {
       return { status: 'error', error: err.message };
     }
@@ -102,6 +99,18 @@ export class HealthService {
     }
   }
 
+  async checkStellar(): Promise<ProbeResult> {
+    if (!this.stellarService) return { status: 'not_configured' };
+
+    const start = Date.now();
+    try {
+      await this.stellarService.getServer().serverInfo();
+      return { status: 'ok', latency_ms: Date.now() - start };
+    } catch (err: any) {
+      return { status: 'error', error: err.message };
+    }
+  }
+
   liveness() {
     return {
       status: 'ok' as const,
@@ -111,17 +120,19 @@ export class HealthService {
   }
 
   async readiness(): Promise<ReadinessResult> {
-    const [database, cache] = await Promise.all([
+    const [database, cache, stellar] = await Promise.all([
       this.checkDatabase(),
       this.checkCache(),
+      this.checkStellar(),
     ]);
 
-    const degraded = database.status === 'error' || cache.status === 'error';
+    const degraded =
+      database.status === 'error' || cache.status === 'error';
 
     return {
       status: degraded ? 'degraded' : 'ok',
       timestamp: new Date().toISOString(),
-      checks: { database, cache },
+      checks: { database, cache, stellar },
     };
   }
 }
